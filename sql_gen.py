@@ -160,7 +160,7 @@ async def main():
         prompt = sys.argv[1]
 
     async with database_connect(
-        'postgresql://postgres:postgres@localhost:54320', 'pydantic_ai_sql_gen'
+        'postgresql://postgres:postgres@localhost:5432', 'postgres'
     ) as conn:
         deps = Deps(conn)
         result = await agent.run(prompt, deps=deps)
@@ -173,6 +173,90 @@ async def main():
                 query += ' LIMIT 100'
             rows = await conn.fetch(query)
             result.output.results = [dict(row) for row in rows]
+            
+            # If no results found, extract columns from the query and show distinct values
+            if not result.output.results:
+                with logfire.span('fetch_distinct_values'):
+                    # First, get all available columns from the table
+                    try:
+                        all_columns = await conn.fetch(
+                            "SELECT column_name FROM information_schema.columns WHERE table_name = 'records'"
+                        )
+                        all_column_names = [row['column_name'] for row in all_columns]
+                    except asyncpg.exceptions.PostgresError:
+                        all_column_names = []
+                    
+                    # Extract columns from the query's WHERE clause
+                    query_lower = query.lower()
+                    where_part = ""
+                    if 'where' in query_lower:
+                        where_part = query_lower.split('where')[1]
+                        if 'limit' in where_part:
+                            where_part = where_part.split('limit')[0]
+                        if 'order by' in where_part:
+                            where_part = where_part.split('order by')[0]
+                        if 'group by' in where_part:
+                            where_part = where_part.split('group by')[0]
+                    
+                    # Find columns mentioned in the WHERE clause
+                    columns_to_check = []
+                    for column in all_column_names:
+                        if column in where_part:
+                            columns_to_check.append(column)
+                    
+                    # If extracting from WHERE clause didn't work, look at attributes or jsonb access
+                    if not columns_to_check and "attributes->" in where_part:
+                        try:
+                            # Get all unique keys in the attributes JSONB column
+                            json_keys = await conn.fetch(
+                                "SELECT DISTINCT jsonb_object_keys(attributes) as key FROM records WHERE attributes IS NOT NULL"
+                            )
+                            if json_keys:
+                                columns_to_check.append('attributes')
+                        except asyncpg.exceptions.PostgresError:
+                            pass
+                    
+                    # If still no columns, add default important columns
+                    if not columns_to_check:
+                        default_important = ['service_name', 'level', 'tags']
+                        columns_to_check = [col for col in default_important if col in all_column_names]
+                    
+                    # Get distinct values for identified columns
+                    distinct_values = {}
+                    
+                    for column in columns_to_check:
+                        try:
+                            if column == 'attributes':
+                                # For JSONB column, show the available keys
+                                distinct_vals = await conn.fetch(
+                                    "SELECT DISTINCT jsonb_object_keys(attributes) as key FROM records WHERE attributes IS NOT NULL LIMIT 20"
+                                )
+                                if distinct_vals:
+                                    distinct_values['attributes.keys'] = [row['key'] for row in distinct_vals]
+                            else:
+                                # For regular columns, show distinct values
+                                distinct_vals = await conn.fetch(f"SELECT DISTINCT {column} FROM records LIMIT 20")
+                                if distinct_vals:
+                                    distinct_values[column] = [dict(row)[column] for row in distinct_vals]
+                        except asyncpg.exceptions.PostgresError:
+                            continue
+                    
+                    if distinct_values:
+                        result.output.explanation += "\n\n**No results found for your query. Here are available values you can search for:**\n\n"
+                        for column, values in distinct_values.items():
+                            if column == 'attributes.keys':
+                                result.output.explanation += f"\n**Available attribute keys**: {', '.join(repr(v) for v in values if v is not None)}\n"
+                            else:
+                                # Special handling for array types like tags
+                                if column == 'tags' and values and isinstance(values[0], list):
+                                    # Flatten the list of arrays
+                                    all_tags = set()
+                                    for tag_list in values:
+                                        if tag_list:
+                                            all_tags.update(tag_list)
+                                    result.output.explanation += f"\n**{column}**: {', '.join(repr(v) for v in all_tags if v is not None)}\n"
+                                else:
+                                    result.output.explanation += f"\n**{column}**: {', '.join(repr(v) for v in values if v is not None)}\n"
 
     debug(result.output)
 

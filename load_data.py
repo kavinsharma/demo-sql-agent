@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 # Database connection details (should match sql_gen.py)
-DATABASE_URL = 'postgresql://postgres:postgres@localhost:54320/pydantic_ai_sql_gen'
+DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/postgres'
 
 # Sample data
 SAMPLE_RECORDS = [
@@ -85,6 +85,29 @@ async def load_sample_data():
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         print(f"Connected to database {DATABASE_URL}")
+
+        # # if the table is not present, create it
+        await conn.execute("""
+        CREATE TABLE records (
+            created_at timestamptz,
+            start_timestamp timestamptz,
+            end_timestamp timestamptz,
+            trace_id text,
+            span_id text,
+            parent_span_id text,
+            level text,
+            span_name text,
+            message text,
+            attributes_json_schema text,
+            attributes jsonb,
+            tags text[],
+            is_exception boolean,
+            otel_status_message text,
+            service_name text
+        );
+        """)
+            
+
 
         # Prepare the INSERT statement dynamically based on keys in the first record
         # Assumes all records have the same keys
