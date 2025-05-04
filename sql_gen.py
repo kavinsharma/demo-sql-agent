@@ -24,10 +24,9 @@ import logfire
 from annotated_types import MinLen
 from devtools import debug
 from pydantic import BaseModel, Field
-from typing_extensions import TypeAlias
 from dotenv import load_dotenv
 
-from pydantic_ai import Agent, ModelRetry, RunContext, format_as_xml
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.providers.google_gla import GoogleGLAProvider
 
 # Load environment variables from .env file
@@ -56,50 +55,76 @@ CREATE TABLE records (
     service_name text
 );
 """
-SQL_EXAMPLES = [
-    {
-        'request': 'show me records where foobar is false',
-        'response': "SELECT * FROM records WHERE attributes->>'foobar' = false",
-    },
-    {
-        'request': 'show me records where attributes include the key "foobar"',
-        'response': "SELECT * FROM records WHERE attributes ? 'foobar'",
-    },
-    {
-        'request': 'show me records from yesterday',
-        'response': "SELECT * FROM records WHERE start_timestamp::date > CURRENT_TIMESTAMP - INTERVAL '1 day'",
-    },
-    {
-        'request': 'show me error records with the tag "foobar"',
-        'response': "SELECT * FROM records WHERE level = 'error' and 'foobar' = ANY(tags)",
-    },
-]
-
 
 @dataclass
 class Deps:
     conn: asyncpg.Connection
 
+# Define tools before initializing the agent
 
-class Success(BaseModel):
-    """Response when SQL could be successfully generated."""
+async def select_records(
+    ctx: RunContext[Deps], 
+    columns: list[str] | None = None,
+    filters: str | None = None, 
+    limit: int = 100,
+) -> list[dict[str, Any]] | str:
+    """Select records from the 'records' table based on specified criteria.
 
-    sql_query: Annotated[str, MinLen(1)]
-    explanation: str = Field(
-        '', description='Explanation of the SQL query, as markdown'
-    )
-    results: list[dict[str, Any]] | None = Field(
-        None, description='Results of executing the SQL query'
-    )
+    Args:
+        columns: List of columns to select. Defaults to all columns (*).
+        filters: SQL WHERE clause conditions (e.g., "level = 'error' AND start_timestamp::date > CURRENT_DATE - INTERVAL '1 day'").
+        limit: Maximum number of records to return.
+    """
+    conn = ctx.deps.conn
+    select_cols = ", ".join(f'"{col}"' for col in columns) if columns else "*"
+    query = f"SELECT {select_cols} FROM records"
+    if filters:
+        query += f" WHERE {filters}"
+    query += f" LIMIT {limit}"
 
+    logfire.info(f"Executing tool-generated query: {query}")
+    try:
+        rows = await conn.fetch(query)
+        results = [dict(row) for row in rows]
+        
+        # If no results, fetch distinct values like before (simplified)
+        if not results and filters:
+             # Basic attempt to find columns in filters
+            potential_cols = []
+            all_db_cols = await conn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name = 'records'")
+            all_db_col_names = [r['column_name'] for r in all_db_cols]
+            for col in all_db_col_names:
+                if col in filters:
+                     potential_cols.append(col)
+            if not potential_cols:
+                 potential_cols = [c for c in ['level', 'service_name', 'tags'] if c in all_db_col_names] # Fallback
 
-class InvalidRequest(BaseModel):
-    """Response the user input didn't include enough information to generate SQL."""
+            distinct_info = "\n\n**No results found. Available values for potentially relevant columns:**\n"
+            for col in potential_cols[:3]: # Limit distinct value checks
+                try:
+                    distinct_vals = await conn.fetch(f'SELECT DISTINCT "{col}" FROM records LIMIT 10')
+                    if distinct_vals:
+                        vals = [dict(r)[col] for r in distinct_vals]
+                        # Handle list of lists for tags
+                        if col == 'tags' and vals and isinstance(vals[0], list):
+                            flat_tags = {tag for sublist in vals if sublist for tag in sublist}
+                            distinct_info += f"- **{col}**: {', '.join(repr(v) for v in flat_tags)}\n"
+                        else:
+                            distinct_info += f"- **{col}**: {', '.join(repr(v) for v in vals)}\n"
+                except Exception as e:
+                    logfire.warn(f"Could not fetch distinct values for {col}: {e}")
+            return distinct_info
+        
+        # Return results, potentially formatting them nicely
+        if results:
+            return f"Found {len(results)} records:\n" + "\n".join(str(r) for r in results[:5]) + ("\n..." if len(results) > 5 else "")
+        else:
+             return "No records found matching your criteria."
 
-    error_message: str
-
-
-Response: TypeAlias = Union[Success, InvalidRequest]
+    except asyncpg.exceptions.PostgresError as e:
+        logfire.error(f"Error executing tool query: {e}")
+        # Inform the LLM about the error so it can potentially fix the filter
+        raise ModelRetry(f'Error executing SQL: {e}. Use the exact column names from the schema and correct SQL syntax for filters.') from e
 
 # Get API key from environment
 gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -109,48 +134,101 @@ if not gemini_api_key:
 # Explicitly create the provider with the API key
 provider = GoogleGLAProvider(api_key=gemini_api_key)
 
-agent: Agent[Deps, Response] = Agent(
+agent: Agent[Deps, str] = Agent(
     model='google-gla:gemini-1.5-flash',
     provider=provider,
-    # Type ignore while we wait for PEP-0747, nonetheless unions will work fine everywhere else
-    output_type=Response,  # type: ignore
-    deps_type=Deps,
+    output_type=str,  # Output is now a string summary/result
     instrument=True,
 )
 
 
+@agent.tool
+async def select_records(
+    ctx: RunContext[Deps], 
+    columns: list[str] | None = None,
+    filters: str | None = None, 
+    limit: int = 100,
+) -> list[dict[str, Any]] | str:
+    """Select records from the 'records' table based on specified criteria.
+
+    Args:
+        columns: List of columns to select. Defaults to all columns (*).
+        filters: SQL WHERE clause conditions (e.g., "level = 'error' AND start_timestamp::date > CURRENT_DATE - INTERVAL '1 day'").
+        limit: Maximum number of records to return.
+    """
+    conn = ctx.deps.conn
+    select_cols = ", ".join(f'"{col}"' for col in columns) if columns else "*"
+    query = f"SELECT {select_cols} FROM records"
+    if filters:
+        query += f" WHERE {filters}"
+    query += f" LIMIT {limit}"
+
+    logfire.info(f"Executing tool-generated query: {query}")
+    try:
+        rows = await conn.fetch(query)
+        results = [dict(row) for row in rows]
+        
+        # If no results, fetch distinct values like before (simplified)
+        if not results and filters:
+             # Basic attempt to find columns in filters
+            potential_cols = []
+            all_db_cols = await conn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name = 'records'")
+            all_db_col_names = [r['column_name'] for r in all_db_cols]
+            for col in all_db_col_names:
+                if col in filters:
+                     potential_cols.append(col)
+            if not potential_cols:
+                 potential_cols = [c for c in ['level', 'service_name', 'tags'] if c in all_db_col_names] # Fallback
+
+            distinct_info = "\n\n**No results found. Available values for potentially relevant columns:**\n"
+            for col in potential_cols[:3]: # Limit distinct value checks
+                try:
+                    distinct_vals = await conn.fetch(f'SELECT DISTINCT "{col}" FROM records LIMIT 10')
+                    if distinct_vals:
+                        vals = [dict(r)[col] for r in distinct_vals]
+                        # Handle list of lists for tags
+                        if col == 'tags' and vals and isinstance(vals[0], list):
+                            flat_tags = {tag for sublist in vals if sublist for tag in sublist}
+                            distinct_info += f"- **{col}**: {', '.join(repr(v) for v in flat_tags)}\n"
+                        else:
+                            distinct_info += f"- **{col}**: {', '.join(repr(v) for v in vals)}\n"
+                except Exception as e:
+                    logfire.warn(f"Could not fetch distinct values for {col}: {e}")
+            return distinct_info
+        
+        # Return results, potentially formatting them nicely
+        if results:
+            return f"Found {len(results)} records:\n" + "\n".join(str(r) for r in results[:5]) + ("\n..." if len(results) > 5 else "")
+        else:
+             return "No records found matching your criteria."
+
+    except asyncpg.exceptions.PostgresError as e:
+        logfire.error(f"Error executing tool query: {e}")
+        # Inform the LLM about the error so it can potentially fix the filter
+        raise ModelRetry(f'Error executing SQL: {e}. Use the exact column names from the schema and correct SQL syntax for filters.') from e
+
+
+# New system prompt instructing the use of tools
 @agent.system_prompt
 async def system_prompt() -> str:
     return f"""\
-Given the following PostgreSQL table of records, your job is to
-write a SQL query that suits the user's request.
+You are an assistant that helps query a PostgreSQL database containing log records.
+Use the available tools to answer the user's request about the data.
+Do NOT generate raw SQL queries yourself. Use the 'select_records' tool.
 
-Database schema:
+Database schema for the 'records' table:
 
 {DB_SCHEMA}
 
 today's date = {date.today()}
 
-{format_as_xml(SQL_EXAMPLES)}
+When using the 'select_records' tool:
+- Provide the SQL `WHERE` clause logic in the `filters` argument.
+- Ensure filter syntax is correct PostgreSQL.
+- Use column names exactly as defined in the schema.
+- You can specify `columns` to retrieve only specific fields.
+- The tool handles query execution and returns results or relevant information if no results are found.
 """
-
-
-@agent.output_validator
-async def validate_output(ctx: RunContext[Deps], output: Response) -> Response:
-    if isinstance(output, InvalidRequest):
-        return output
-
-    # gemini often adds extraneous backslashes to SQL
-    output.sql_query = output.sql_query.replace('\\', '')
-    if not output.sql_query.upper().startswith('SELECT'):
-        raise ModelRetry('Please create a SELECT query')
-
-    try:
-        await ctx.deps.conn.execute(f'EXPLAIN {output.sql_query}')
-    except asyncpg.exceptions.PostgresError as e:
-        raise ModelRetry(f'Invalid query: {e}') from e
-    else:
-        return output
 
 
 async def main():
@@ -159,106 +237,28 @@ async def main():
     else:
         prompt = sys.argv[1]
 
+    db_dsn = 'postgresql://postgres:postgres@localhost:5432' # Correct port
+    db_name = 'postgres'
+
     async with database_connect(
-        'postgresql://postgres:postgres@localhost:5432', 'postgres'
+        db_dsn, db_name
     ) as conn:
         deps = Deps(conn)
+        # The agent now handles tool execution internally based on the prompt
         result = await agent.run(prompt, deps=deps)
 
-        # Execute the query if generation was successful
-        if isinstance(result.output, Success):
-            query = result.output.sql_query
-            # Limit results to avoid excessive output
-            if 'LIMIT' not in query.upper():
-                query += ' LIMIT 100'
-            rows = await conn.fetch(query)
-            result.output.results = [dict(row) for row in rows]
-            
-            # If no results found, extract columns from the query and show distinct values
-            if not result.output.results:
-                with logfire.span('fetch_distinct_values'):
-                    # First, get all available columns from the table
-                    try:
-                        all_columns = await conn.fetch(
-                            "SELECT column_name FROM information_schema.columns WHERE table_name = 'records'"
-                        )
-                        all_column_names = [row['column_name'] for row in all_columns]
-                    except asyncpg.exceptions.PostgresError:
-                        all_column_names = []
-                    
-                    # Extract columns from the query's WHERE clause
-                    query_lower = query.lower()
-                    where_part = ""
-                    if 'where' in query_lower:
-                        where_part = query_lower.split('where')[1]
-                        if 'limit' in where_part:
-                            where_part = where_part.split('limit')[0]
-                        if 'order by' in where_part:
-                            where_part = where_part.split('order by')[0]
-                        if 'group by' in where_part:
-                            where_part = where_part.split('group by')[0]
-                    
-                    # Find columns mentioned in the WHERE clause
-                    columns_to_check = []
-                    for column in all_column_names:
-                        if column in where_part:
-                            columns_to_check.append(column)
-                    
-                    # If extracting from WHERE clause didn't work, look at attributes or jsonb access
-                    if not columns_to_check and "attributes->" in where_part:
-                        try:
-                            # Get all unique keys in the attributes JSONB column
-                            json_keys = await conn.fetch(
-                                "SELECT DISTINCT jsonb_object_keys(attributes) as key FROM records WHERE attributes IS NOT NULL"
-                            )
-                            if json_keys:
-                                columns_to_check.append('attributes')
-                        except asyncpg.exceptions.PostgresError:
-                            pass
-                    
-                    # If still no columns, add default important columns
-                    if not columns_to_check:
-                        default_important = ['service_name', 'level', 'tags']
-                        columns_to_check = [col for col in default_important if col in all_column_names]
-                    
-                    # Get distinct values for identified columns
-                    distinct_values = {}
-                    
-                    for column in columns_to_check:
-                        try:
-                            if column == 'attributes':
-                                # For JSONB column, show the available keys
-                                distinct_vals = await conn.fetch(
-                                    "SELECT DISTINCT jsonb_object_keys(attributes) as key FROM records WHERE attributes IS NOT NULL LIMIT 20"
-                                )
-                                if distinct_vals:
-                                    distinct_values['attributes.keys'] = [row['key'] for row in distinct_vals]
-                            else:
-                                # For regular columns, show distinct values
-                                distinct_vals = await conn.fetch(f"SELECT DISTINCT {column} FROM records LIMIT 20")
-                                if distinct_vals:
-                                    distinct_values[column] = [dict(row)[column] for row in distinct_vals]
-                        except asyncpg.exceptions.PostgresError:
-                            continue
-                    
-                    if distinct_values:
-                        result.output.explanation += "\n\n**No results found for your query. Here are available values you can search for:**\n\n"
-                        for column, values in distinct_values.items():
-                            if column == 'attributes.keys':
-                                result.output.explanation += f"\n**Available attribute keys**: {', '.join(repr(v) for v in values if v is not None)}\n"
-                            else:
-                                # Special handling for array types like tags
-                                if column == 'tags' and values and isinstance(values[0], list):
-                                    # Flatten the list of arrays
-                                    all_tags = set()
-                                    for tag_list in values:
-                                        if tag_list:
-                                            all_tags.update(tag_list)
-                                    result.output.explanation += f"\n**{column}**: {', '.join(repr(v) for v in all_tags if v is not None)}\n"
-                                else:
-                                    result.output.explanation += f"\n**{column}**: {', '.join(repr(v) for v in values if v is not None)}\n"
+        # The result.output is now the final string response from the agent
+        # (either summarizing tool execution or the direct string output of the tool)
+        print("\n--- Agent Response ---")
+        if isinstance(result.output, str):
+            print(result.output)
+        else:
+            # In case the tool returned raw data (though we aimed for string)
+            debug(result.output)
+        print("--------------------")
 
-    debug(result.output)
+    # Old logic for executing query and fetching distinct values is removed,
+    # as it's now handled within the select_records tool.
 
 
 # pyright: reportUnknownMemberType=false
@@ -266,7 +266,7 @@ async def main():
 @asynccontextmanager
 async def database_connect(server_dsn: str, database: str) -> AsyncGenerator[Any, None]:
     with logfire.span('check and create DB'):
-        conn = await asyncpg.connect(server_dsn)
+        conn = await asyncpg.connect(server_dsn) # Connect to the server DSN first
         try:
             db_exists = await conn.fetchval(
                 'SELECT 1 FROM pg_database WHERE datname = $1', database
@@ -276,14 +276,23 @@ async def database_connect(server_dsn: str, database: str) -> AsyncGenerator[Any
         finally:
             await conn.close()
 
-    conn = await asyncpg.connect(f'{server_dsn}/{database}')
+    # Now connect to the specific database using the full DSN
+    db_full_dsn = f'{server_dsn}/{database}'
+    conn = await asyncpg.connect(db_full_dsn)
     try:
         with logfire.span('create schema'):
             async with conn.transaction():
-                if not db_exists:
-                    await conn.execute(
+                # Check if the enum type exists before creating
+                type_exists = await conn.fetchval("SELECT 1 FROM pg_type WHERE typname = 'log_level'")
+                if not type_exists:
+                     await conn.execute(
                         "CREATE TYPE log_level AS ENUM ('debug', 'info', 'warning', 'error', 'critical')"
-                    )
+                     )
+                # Check if the table exists before creating
+                table_exists = await conn.fetchval(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'records'"
+                )
+                if not table_exists:
                     await conn.execute(DB_SCHEMA)
         yield conn
     finally:
