@@ -21,9 +21,7 @@ from typing import Annotated, Any, Union
 
 import asyncpg
 import logfire
-from annotated_types import MinLen
 from devtools import debug
-from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from pydantic_ai import Agent, ModelRetry, RunContext
@@ -126,6 +124,55 @@ async def select_records(
         # Inform the LLM about the error so it can potentially fix the filter
         raise ModelRetry(f'Error executing SQL: {e}. Use the exact column names from the schema and correct SQL syntax for filters.') from e
 
+async def aggregate_records(
+    ctx: RunContext[Deps],
+    aggregations: list[str] = ["COUNT(*)"],
+    group_by: list[str] | None = None,
+    filters: str | None = None,
+    order_by: str | None = None,
+    limit: int | None = None # Limit might still be useful for top-N groups
+) -> list[dict[str, Any]] | str:
+    """Perform aggregation queries on the 'records' table (e.g., COUNT, AVG, SUM) with optional grouping.
+
+    Args:
+        aggregations: List of SQL aggregation functions (e.g., ["COUNT(*) AS count", "AVG(duration_ms)"]). Defaults to ["COUNT(*)"].
+        group_by: List of columns to GROUP BY (e.g., ["level", "DATE_TRUNC('week', created_at)"]).
+        filters: SQL WHERE clause conditions (e.g., "service_name = 'api'").
+        order_by: SQL ORDER BY clause (e.g., "count DESC").
+        limit: Maximum number of aggregated groups to return.
+    """
+    conn = ctx.deps.conn
+    select_clause = ", ".join(aggregations)
+    if group_by:
+        select_clause += ", " + ", ".join(group_by)
+
+    query = f"SELECT {select_clause} FROM records"
+    if filters:
+        query += f" WHERE {filters}"
+    if group_by:
+        query += f" GROUP BY {', '.join(group_by)}"
+    if order_by:
+        query += f" ORDER BY {order_by}"
+    if limit is not None:
+        query += f" LIMIT {limit}"
+
+    logfire.info(f"Executing aggregation tool query: {query}")
+    try:
+        rows = await conn.fetch(query)
+        results = [dict(row) for row in rows]
+        if results:
+             # Format results for display
+             header = " | ".join(results[0].keys())
+             separator = "-" * len(header)
+             data_rows = [" | ".join(map(str, row.values())) for row in results]
+             return f"Aggregation results:\n{header}\n{separator}\n" + "\n".join(data_rows)
+        else:
+            return "No results found for the aggregation."
+
+    except asyncpg.exceptions.PostgresError as e:
+        logfire.error(f"Error executing aggregation query: {e}")
+        raise ModelRetry(f'Error executing aggregation SQL: {e}. Please check arguments like aggregations, group_by, filters.') from e
+
 # Get API key from environment
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
@@ -208,13 +255,68 @@ async def select_records(
         raise ModelRetry(f'Error executing SQL: {e}. Use the exact column names from the schema and correct SQL syntax for filters.') from e
 
 
+@agent.tool
+async def aggregate_records(
+    ctx: RunContext[Deps],
+    aggregations: list[str] = ["COUNT(*)"],
+    group_by: list[str] | None = None,
+    filters: str | None = None,
+    order_by: str | None = None,
+    limit: int | None = None # Limit might still be useful for top-N groups
+) -> list[dict[str, Any]] | str:
+    """Perform aggregation queries on the 'records' table (e.g., COUNT, AVG, SUM) with optional grouping.
+
+    Args:
+        aggregations: List of SQL aggregation functions (e.g., ["COUNT(*) AS count", "AVG(duration_ms)"]). Defaults to ["COUNT(*)"].
+        group_by: List of columns to GROUP BY (e.g., ["level", "DATE_TRUNC('week', created_at)"]).
+        filters: SQL WHERE clause conditions (e.g., "service_name = 'api'").
+        order_by: SQL ORDER BY clause (e.g., "count DESC").
+        limit: Maximum number of aggregated groups to return.
+    """
+    conn = ctx.deps.conn
+    select_clause = ", ".join(aggregations)
+    if group_by:
+        select_clause += ", " + ", ".join(group_by)
+
+    query = f"SELECT {select_clause} FROM records"
+    if filters:
+        query += f" WHERE {filters}"
+    if group_by:
+        query += f" GROUP BY {', '.join(group_by)}"
+    if order_by:
+        query += f" ORDER BY {order_by}"
+    if limit is not None:
+        query += f" LIMIT {limit}"
+
+    logfire.info(f"Executing aggregation tool query: {query}")
+    try:
+        rows = await conn.fetch(query)
+        results = [dict(row) for row in rows]
+        if results:
+             # Format results for display
+             header = " | ".join(results[0].keys())
+             separator = "-" * len(header)
+             data_rows = [" | ".join(map(str, row.values())) for row in results]
+             return f"Aggregation results:\n{header}\n{separator}\n" + "\n".join(data_rows)
+        else:
+            return "No results found for the aggregation."
+
+    except asyncpg.exceptions.PostgresError as e:
+        logfire.error(f"Error executing aggregation query: {e}")
+        raise ModelRetry(f'Error executing aggregation SQL: {e}. Please check arguments like aggregations, group_by, filters.') from e
+
+
 # New system prompt instructing the use of tools
 @agent.system_prompt
 async def system_prompt() -> str:
     return f"""\
 You are an assistant that helps query a PostgreSQL database containing log records.
 Use the available tools to answer the user's request about the data.
-Do NOT generate raw SQL queries yourself. Use the 'select_records' tool.
+Do NOT generate raw SQL queries yourself.
+
+Available Tools:
+- `select_records`: Use to fetch specific log entries based on filters.
+- `aggregate_records`: Use for requests involving counting, averaging, summing, or grouping data (e.g., 'count by week', 'average duration').
 
 Database schema for the 'records' table:
 
@@ -222,12 +324,11 @@ Database schema for the 'records' table:
 
 today's date = {date.today()}
 
-When using the 'select_records' tool:
-- Provide the SQL `WHERE` clause logic in the `filters` argument.
+Tool Usage Notes:
+- Always use column names exactly as defined in the schema.
 - Ensure filter syntax is correct PostgreSQL.
-- Use column names exactly as defined in the schema.
-- You can specify `columns` to retrieve only specific fields.
-- The tool handles query execution and returns results or relevant information if no results are found.
+- For `select_records`, provide the SQL `WHERE` clause logic in the `filters` argument.
+- For `aggregate_records`, specify the aggregation function(s) in `aggregations` and grouping columns in `group_by`.
 """
 
 
